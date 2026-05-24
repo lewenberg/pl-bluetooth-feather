@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../dev/embedded"
+		},
+		{
+			"name": "embedded",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
