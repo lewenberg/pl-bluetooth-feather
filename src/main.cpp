@@ -1,36 +1,49 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <WiFi.h>
-#include "wifi_config.h"
-
-#ifndef WIFI_PASSWORD
-#error "WIFI_PASSWORD must be set in .env"
-#endif
-
-#ifndef WIFI_TARGET_BSSID
-#error "WIFI_TARGET_BSSID must be set in .env"
-#endif
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <algorithm>
+#include <cctype>
 
 namespace {
-constexpr char WIFI_PASSWORD_TEXT[] = WIFI_PASSWORD;
-constexpr char TARGET_BSSID_TEXT[] = WIFI_TARGET_BSSID;
+// BLE Service and Characteristic UUIDs (Standard Heart Rate Service)
+static BLEUUID serviceUUID("180d");
+static BLEUUID charUUID("2a37");
+
+// BLE connection control states
+bool doConnect = false;
+bool connected = false;
+bool doScan = false;
+
+BLEAdvertisedDevice* myDevice = nullptr;
+BLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
+BLEClient* pClient = nullptr;
+
+// Heart rate tracking variables
+uint16_t currentHeartRate = 0;
+unsigned long lastHeartRateUpdateMs = 0;
+
+// Logging & Heartbeat timing
 constexpr uint8_t STATUS_LED_PIN = PIN_NEOPIXEL;
-constexpr uint8_t STATUS_LED_BRIGHTNESS = 1;
+constexpr uint8_t STATUS_LED_BRIGHTNESS = 4; // Slightly brighter for visibility
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 10000;
 constexpr unsigned long HEARTBEAT_ON_MS = 1000;
 constexpr unsigned long STATUS_LOG_INTERVAL_MS = 5000;
 constexpr unsigned long BATTERY_LOG_INTERVAL_MS = 10000;
 constexpr unsigned long LOOP_DELAY_MS = 50;
-constexpr uint8_t MAX17048_ADDRESS = 0x36;
-constexpr uint8_t MAX17048_VCELL_REGISTER = 0x02;
-constexpr uint8_t MAX17048_SOC_REGISTER = 0x04;
-constexpr uint8_t MAX17048_CRATE_REGISTER = 0x16;
 
-uint8_t targetBssid[6] = {0};
 unsigned long lastHeartbeatAt = 0;
 unsigned long lastStatusLogAt = 0;
 unsigned long lastBatteryLogAt = 0;
 bool heartbeatOn = false;
+
+// MAX17048 Fuel Gauge registers
+constexpr uint8_t MAX17048_ADDRESS = 0x36;
+constexpr uint8_t MAX17048_VCELL_REGISTER = 0x02;
+constexpr uint8_t MAX17048_SOC_REGISTER = 0x04;
+constexpr uint8_t MAX17048_CRATE_REGISTER = 0x16;
 
 void setStatusLed(uint8_t red, uint8_t green, uint8_t blue) {
   rgbLedWrite(STATUS_LED_PIN, red, green, blue);
@@ -81,7 +94,7 @@ void printBatteryStatus() {
   if (!readMax17048Register(MAX17048_VCELL_REGISTER, vcellRaw) ||
       !readMax17048Register(MAX17048_SOC_REGISTER, socRaw) ||
       !readMax17048Register(MAX17048_CRATE_REGISTER, crateRaw)) {
-    Serial.println("Battery: MAX17048 not found");
+    Serial.println("[Battery] MAX17048 fuel gauge not found over I2C");
     return;
   }
 
@@ -96,29 +109,19 @@ void printBatteryStatus() {
     direction = "discharging";
   }
 
-  Serial.print("Battery: ");
+  Serial.print("[Battery] ");
   Serial.print(voltage, 3);
-  Serial.print("V | charge ");
+  Serial.print("V | Charge ");
   Serial.print(chargePercent, 1);
-  Serial.print("% | rate ");
+  Serial.print("% | Rate ");
   Serial.print(ratePercentPerHour, 1);
   Serial.print("%/hr ");
   Serial.print(direction);
-  Serial.print(" | health ");
+  Serial.print(" | Health ");
   Serial.println(batteryHealthLabel(voltage, chargePercent));
 }
 
-void showConnecting() {
-  heartbeatOn = false;
-  setStatusLed(STATUS_LED_BRIGHTNESS, 0, 0);
-}
-
-void showConnected() {
-  heartbeatOn = true;
-  lastHeartbeatAt = millis();
-  setStatusLed(0, STATUS_LED_BRIGHTNESS, 0);
-}
-
+// Visual heartbeat feedback when connected
 void updateConnectedHeartbeat() {
   const unsigned long now = millis();
 
@@ -130,101 +133,140 @@ void updateConnectedHeartbeat() {
   }
 
   if (!heartbeatOn && now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+    // Pulse Green when connected
     setStatusLed(0, STATUS_LED_BRIGHTNESS, 0);
     heartbeatOn = true;
     lastHeartbeatAt = now;
   }
 }
 
-bool parseBssid(const char *text, uint8_t out[6]) {
-  return sscanf(text, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &out[0], &out[1],
-                &out[2], &out[3], &out[4], &out[5]) == 6;
+// Case-insensitive check for PowerLabs-like BLE names
+bool isPowerlabsDevice(const std::string& name) {
+  if (name.empty()) return false;
+  std::string lowerName = name;
+  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
+
+  return (lowerName.find("powerlabs") != std::string::npos ||
+          lowerName.find("pwrlabs") != std::string::npos ||
+          lowerName.find("powrlabs") != std::string::npos ||
+          lowerName.find("pwr-labs") != std::string::npos ||
+          lowerName.find("pwr_labs") != std::string::npos ||
+          lowerName.find("power labs") != std::string::npos ||
+          lowerName.find("powr labs") != std::string::npos ||
+          lowerName.find("pwr labs") != std::string::npos);
 }
 
-bool bssidMatches(int networkIndex) {
-  const uint8_t *found = WiFi.BSSID(networkIndex);
-  if (found == nullptr) {
+// Notification callback for Heart Rate Measurement characteristic
+void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic,
+                    uint8_t* pData, size_t length, bool isNotify) {
+  if (length < 2) return;
+
+
+
+  uint8_t flags = pData[0];
+  uint16_t heartRate = 0;
+
+  // Flag bit 0: Heart Rate Value Format (0 = UINT8, 1 = UINT16)
+  if (flags & 0x01) {
+    if (length >= 3) {
+      heartRate = pData[1] | (pData[2] << 8);
+    }
+  } else {
+    heartRate = pData[1];
+  }
+
+  if (heartRate > 0 && heartRate < 240) {
+    currentHeartRate = heartRate;
+    lastHeartRateUpdateMs = millis();
+  }
+}
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) override {
+    // Managed during connectToServer execution flow
+  }
+
+  void onDisconnect(BLEClient* pclient) override {
+    connected = false;
+    Serial.println("[BLE] Disconnected from BLE Heart Rate Monitor.");
+  }
+};
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    bool isMatch = false;
+
+    // Matches standard Heart Rate Service or PowerLabs naming convention
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      isMatch = true;
+    } else if (advertisedDevice.haveName() && isPowerlabsDevice(advertisedDevice.getName().c_str())) {
+      isMatch = true;
+    }
+
+    if (isMatch) {
+      Serial.printf("[BLE] Matching device discovered: %s [%s]\n",
+                    advertisedDevice.getName().c_str(),
+                    advertisedDevice.getAddress().toString().c_str());
+
+      // Stop active scan immediately
+      BLEDevice::getScan()->stop();
+
+      if (myDevice != nullptr) {
+        delete myDevice;
+      }
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+      doScan = false;
+    }
+  }
+};
+
+bool connectToServer() {
+  if (myDevice == nullptr) return false;
+
+  Serial.printf("[BLE] Establishing connection to %s...\n", myDevice->getAddress().toString().c_str());
+
+  if (pClient == nullptr) {
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+  }
+
+  if (!pClient->connect(myDevice)) {
+    Serial.println("[BLE] Connection attempt failed.");
     return false;
   }
 
-  for (size_t i = 0; i < 6; ++i) {
-    if (found[i] != targetBssid[i]) {
-      return false;
-    }
+  Serial.println("[BLE] Connected! Retrieving Heart Rate service...");
+  BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+  if (pRemoteService == nullptr) {
+    Serial.printf("[BLE] Service not found: %s\n", serviceUUID.toString().c_str());
+    pClient->disconnect();
+    return false;
   }
 
+  Serial.println("[BLE] Service resolved. Retrieving Heart Rate Measurement characteristic...");
+  pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+  if (pRemoteCharacteristic == nullptr) {
+    Serial.printf("[BLE] Characteristic not found: %s\n", charUUID.toString().c_str());
+    pClient->disconnect();
+    return false;
+  }
+
+  if (pRemoteCharacteristic->canNotify()) {
+    pRemoteCharacteristic->registerForNotify(notifyCallback);
+    Serial.println("[BLE] Subscribed to Heart Rate notifications successfully.");
+  } else {
+    Serial.println("[BLE] Error: Characteristic does not support notifications.");
+    pClient->disconnect();
+    return false;
+  }
+
+  connected = true;
   return true;
 }
-
-bool connectToTargetRouter() {
-  showConnecting();
-
-  if (!parseBssid(TARGET_BSSID_TEXT, targetBssid)) {
-    Serial.println("Bad target BSSID.");
-    return false;
-  }
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(true, true);
-  delay(500);
-
-  Serial.printf("Scanning for router BSSID %s...\n", TARGET_BSSID_TEXT);
-  const int networkCount = WiFi.scanNetworks(false, true);
-  if (networkCount <= 0) {
-    Serial.println("No Wi-Fi networks found.");
-    return false;
-  }
-
-  Serial.printf("Found %d networks:\n", networkCount);
-  for (int i = 0; i < networkCount; ++i) {
-    Serial.printf("  %2d: BSSID %s | CH %2ld | RSSI %4ld | SSID '%s'\n", i + 1,
-                  WiFi.BSSIDstr(i).c_str(), static_cast<long>(WiFi.channel(i)),
-                  static_cast<long>(WiFi.RSSI(i)), WiFi.SSID(i).c_str());
-  }
-
-  for (int i = 0; i < networkCount; ++i) {
-    if (!bssidMatches(i)) {
-      continue;
-    }
-
-    const String ssid = WiFi.SSID(i);
-    const int32_t channel = WiFi.channel(i);
-    Serial.printf("Found SSID '%s' on channel %ld. Connecting...\n",
-                  ssid.c_str(), static_cast<long>(channel));
-
-    WiFi.begin(ssid.c_str(), WIFI_PASSWORD_TEXT, channel, targetBssid);
-
-    const unsigned long startedAt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 20000) {
-      Serial.print(".");
-      delay(500);
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      showConnected();
-      Serial.println("Wi-Fi connected.");
-      Serial.print("IP: ");
-      Serial.println(WiFi.localIP());
-      Serial.print("Gateway: ");
-      Serial.println(WiFi.gatewayIP());
-      Serial.print("DNS: ");
-      Serial.println(WiFi.dnsIP());
-      Serial.print("MAC: ");
-      Serial.println(WiFi.macAddress());
-      Serial.print("BSSID: ");
-      Serial.println(WiFi.BSSIDstr());
-      return true;
-    }
-
-    Serial.printf("Connection failed with status %d.\n", WiFi.status());
-    return false;
-  }
-
-  Serial.println("Target router BSSID was not visible.");
-  return false;
-}
-}  // namespace
+} // namespace
 
 void setup() {
   initStatusLed();
@@ -233,28 +275,75 @@ void setup() {
   delay(1000);
 
   Serial.println();
-  Serial.println("ESP32-C6 Feather Wi-Fi bootstrap");
+  Serial.println("================================================");
+  Serial.println("ESP32-C6 PowerLabs Bluetooth Heart Rate Monitor");
+  Serial.println("================================================");
+
   printBatteryStatus();
-  connectToTargetRouter();
+
+  // Initialize ESP32-C6 BLE hardware as a Central Client
+  BLEDevice::init("ESP32-C6-Feather-Client");
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+
+  Serial.println("[BLE] Bluetooth hardware initialized.");
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Wi-Fi dropped; reconnecting...");
-    connectToTargetRouter();
-  } else {
+  const unsigned long now = millis();
+
+  if (connected) {
     updateConnectedHeartbeat();
 
-    if (millis() - lastStatusLogAt >= STATUS_LOG_INTERVAL_MS) {
-      lastStatusLogAt = millis();
-      Serial.print("Wi-Fi OK. IP: ");
-      Serial.print(WiFi.localIP());
-      Serial.print(" | BSSID: ");
-      Serial.println(WiFi.BSSIDstr());
+    // Log connection stats periodically
+    if (now - lastStatusLogAt >= STATUS_LOG_INTERVAL_MS) {
+      lastStatusLogAt = now;
+      if (now - lastHeartRateUpdateMs < 5000) {
+        Serial.printf("[BLE] Link OK | Heart Rate: %u bpm\n", currentHeartRate);
+      } else {
+        Serial.println("[BLE] Link OK | Connected, waiting for heart rate telemetry...");
+      }
     }
 
-    if (millis() - lastBatteryLogAt >= BATTERY_LOG_INTERVAL_MS) {
-      lastBatteryLogAt = millis();
+    if (now - lastBatteryLogAt >= BATTERY_LOG_INTERVAL_MS) {
+      lastBatteryLogAt = now;
+      printBatteryStatus();
+    }
+
+  } else if (doConnect) {
+    // Transition status color to constant Blue while pairing
+    setStatusLed(0, 0, STATUS_LED_BRIGHTNESS);
+    if (connectToServer()) {
+      connected = true;
+      lastHeartbeatAt = millis();
+      heartbeatOn = false;
+    } else {
+      connected = false;
+      doScan = true;
+    }
+    doConnect = false;
+
+  } else {
+    // If disconnected and not currently establishing a connection, scan for devices
+    Serial.println("[BLE] Scanning for PowerLabs monitor...");
+
+    // Pulse LED Blue while scanning
+    setStatusLed(0, 0, STATUS_LED_BRIGHTNESS);
+
+    if (myDevice != nullptr) {
+      delete myDevice;
+      myDevice = nullptr;
+    }
+
+    BLEDevice::getScan()->start(4, false); // Synchronously scan for 4 seconds
+
+    setStatusLed(0, 0, 0); // Brief dark LED between scans
+
+    if (now - lastBatteryLogAt >= BATTERY_LOG_INTERVAL_MS) {
+      lastBatteryLogAt = now;
       printBatteryStatus();
     }
   }
